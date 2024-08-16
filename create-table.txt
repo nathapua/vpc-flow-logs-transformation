@@ -1,0 +1,29 @@
+CREATE EXTERNAL TABLE IF NOT EXISTS vpc_flow_logs_updated (
+  version STRING,
+  `account-id` STRING,
+  action STRING,
+  bytes INT,
+  dstaddr STRING,
+  dstport INT,
+  `end` BIGINT,
+  `instance-id` STRING,
+  `interface-id` STRING,
+  `log-status` STRING,
+  packets INT,
+  `pkt-dstaddr` STRING,
+  `pkt-srcaddr` STRING,
+  protocol STRING,
+  srcaddr STRING,
+  srcport INT,
+  `start` BIGINT,
+  `subnet-id` STRING,
+  `tcp-flags` STRING,
+  `vpc-id` STRING,
+  `log-type` STRING,
+  `security-group-ids-str` STRING,
+  `network-acl-id` STRING
+)
+PARTITIONED BY (year INT, month INT, day INT)
+STORED AS PARQUET
+LOCATION 's3://lambda-kinesis-security/vpc_flow_logs_updated/partitioned/'
+TBLPROPERTIES ('parquet.compress'='SNAPPY');

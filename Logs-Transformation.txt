@@ -1,0 +1,158 @@
+import json
+import boto3
+import base64
+from io import BytesIO
+from datetime import datetime, timedelta
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# Initialize AWS clients
+ec2 = boto3.client('ec2')
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event))
+    
+    enriched_logs = []
+
+    if 'records' not in event:
+        print("Key 'records' not found in event.")
+        return {
+            'statusCode': 400,
+            'body': json.dumps('KeyError: records not found in event')
+        }
+    
+    processed_records = []
+
+    for record in event['records']:
+        try:
+            # Decode the incoming record data
+            payload = base64.b64decode(record['data']).decode('utf-8').strip()
+            print("Processing payload:", payload)
+            
+            # Clean and split the payload into fields
+            payload = payload.replace('\n', ' ')
+            fields = [field for field in payload.split(' ') if field]  # Remove empty fields
+            print("Extracted fields:", fields)
+            print("Number of fields:", len(fields))
+            
+            # Ensure the correct number of fields is present
+            if len(fields) != 21:
+                print("Incorrect number of fields:", len(fields))
+                processed_records.append({
+                    'recordId': record['recordId'],
+                    'result': 'ProcessingFailed',
+                    'data': base64.b64encode(payload.encode('utf-8')).decode('utf-8')
+                })
+                continue
+
+            # Assign fields to variables
+            version = fields[0].replace('{"message":"', '')
+            account_id = fields[1]
+            action = fields[2]
+            bytes_transferred = int(fields[3]) if fields[3].isdigit() else 0
+            dstaddr = fields[4]
+            dstport = int(fields[5]) if fields[5].isdigit() else 0
+            end = int(fields[6]) if fields[6].isdigit() else 0
+            instance_id = fields[7]
+            interface_id = fields[8]
+            log_status = fields[9]
+            packets = int(fields[10]) if fields[10].isdigit() else 0
+            pkt_dstaddr = fields[11]
+            pkt_srcaddr = fields[12]
+            protocol = fields[13]
+            srcaddr = fields[14]
+            srcport = int(fields[15]) if fields[15].isdigit() else 0
+            start = int(fields[16]) if fields[16].isdigit() else 0
+            subnet_id = fields[17]
+            tcp_flags = fields[18]
+            vpc_id = fields[19]
+            log_type = fields[20].replace('"}', '').replace('"', '')  # Clean log_type field
+            
+            # Validate interface_id format
+            if not interface_id.startswith('eni-'):
+                raise ValueError(f"Invalid interface_id format: {interface_id}")
+
+            # Describe the network interface to get additional details
+            print(f"Describing network interface: {interface_id}")
+            eni_info = ec2.describe_network_interfaces(NetworkInterfaceIds=[interface_id])
+            eni = eni_info['NetworkInterfaces'][0]
+            security_group_ids = [group['GroupId'] for group in eni['Groups']]
+            security_group_ids_str = ','.join(security_group_ids)
+            
+            # Describe the network ACL associated with the subnet
+            print(f"Describing network ACL for subnet: {subnet_id}")
+            acls_info = ec2.describe_network_acls(Filters=[{'Name': 'association.subnet-id', 'Values': [subnet_id]}])
+            network_acl_id = acls_info['NetworkAcls'][0]['NetworkAclId']
+            
+            # Prepare the enriched log entry
+            enriched_log = {
+                "version": version,
+                "account-id": account_id,
+                "action": action,
+                "bytes": bytes_transferred,
+                "dstaddr": dstaddr,
+                "dstport": dstport,
+                "end": end,
+                "instance-id": instance_id,
+                "interface-id": interface_id,
+                "log-status": log_status,
+                "packets": packets,
+                "pkt-dstaddr": pkt_dstaddr,
+                "pkt-srcaddr": pkt_srcaddr,
+                "protocol": protocol,
+                "srcaddr": srcaddr,
+                "srcport": srcport,
+                "start": start,
+                "subnet-id": subnet_id,
+                "tcp-flags": tcp_flags,
+                "vpc-id": vpc_id,
+                "log-type": log_type,
+                "security-group-ids-str": security_group_ids_str,
+                "network-acl-id": network_acl_id
+            }
+            enriched_logs.append(enriched_log)
+            
+            # Prepare the processed record for output
+            processed_record = {
+                'recordId': record['recordId'],
+                'result': 'Ok',
+                'data': base64.b64encode(json.dumps(enriched_log).encode('utf-8')).decode('utf-8')
+            }
+            processed_records.append(processed_record)
+            
+        except Exception as e:
+            print(f"Error processing record with interface ID {interface_id if interface_id else 'Unknown'}: {e}")
+            processed_record = {
+                'recordId': record['recordId'],
+                'result': 'ProcessingFailed',
+                'data': base64.b64encode(payload.encode('utf-8')).decode('utf-8')
+            }
+            processed_records.append(processed_record)
+            continue
+    
+    # Convert the enriched logs to a DataFrame
+    df = pd.DataFrame(enriched_logs)
+    
+    print("DataFrame head:")
+    print(df.head())
+    
+    if not df.empty:
+        try:
+            now = datetime.utcnow() + timedelta(hours=7)  # Adjust time zone as needed
+            key = f'vpc_flow_logs_updated/partitioned/year={now.year}/month={now.month:02d}/day={now.day:02d}/{context.aws_request_id}.parquet'
+            bucket = 'lambda-kinesis-security'
+            
+            # Convert DataFrame to Parquet and upload to S3
+            table = pa.Table.from_pandas(df)
+            out_buffer = BytesIO()
+            pq.write_table(table, out_buffer)
+            s3.put_object(Bucket=bucket, Key=key, Body=out_buffer.getvalue())
+            print(f"Successfully saved enriched logs to S3 at {bucket}/{key}")
+        except Exception as e:
+            print(f"Error saving to S3: {e}")
+    
+    return {
+        'records': processed_records
+    }

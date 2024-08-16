@@ -1,0 +1,7 @@
+MSCK REPAIR TABLE vpc_flow_logs_updated;
+
+
+DESCRIBE vpc_flow_logs_updated;
+
+
+SELECT * FROM vpc_flow_logs_updated

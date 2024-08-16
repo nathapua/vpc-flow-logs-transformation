@@ -1,0 +1,291 @@
+import json
+import boto3
+import time
+import gzip
+import io
+import csv
+from datetime import datetime, timedelta
+
+# Initialize AWS clients
+athena = boto3.client('athena')
+s3 = boto3.client('s3')
+
+# Function to run Athena query
+def run_athena_query(query, database, s3_output):
+    response = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': database},
+        ResultConfiguration={'OutputLocation': s3_output}
+    )
+    return response['QueryExecutionId']
+
+# Function to check Athena query status
+def check_query_status(query_execution_id):
+    while True:
+        response = athena.get_query_execution(QueryExecutionId=query_execution_id)
+        status = response['QueryExecution']['Status']['State']
+        if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            return status, response
+        time.sleep(5)
+
+# Function to download and compress the result
+def download_and_compress_result(bucket, key):
+    # Download the CSV file from S3
+    csv_file = s3.get_object(Bucket=bucket, Key=key)['Body'].read().decode('utf-8')
+
+    # Process the CSV content
+    transformed_lines = []
+    csv_reader = csv.reader(io.StringIO(csv_file))
+    
+    # Add headers to the output
+    headers = next(csv_reader)
+    transformed_lines.append(' '.join(headers))
+    
+    for row in csv_reader:
+        transformed_lines.append(' '.join(row))
+
+    transformed_content = '\n'.join(transformed_lines)
+
+    # Compress the transformed content to GZIP format
+    gz_buffer = io.BytesIO()
+    with gzip.GzipFile(mode='wb', fileobj=gz_buffer) as gz_file:
+        gz_file.write(transformed_content.encode('utf-8'))
+    
+    gz_buffer.seek(0)
+
+    # Upload the GZIP file back to S3
+    gzip_key = key.replace('.csv', '.csv.gz')
+    s3.put_object(Bucket=bucket, Key=gzip_key, Body=gz_buffer, ContentType='application/gzip')
+
+    # Delete the original CSV file
+    s3.delete_object(Bucket=bucket, Key=key)
+
+    return gzip_key
+
+# Lambda handler function
+def lambda_handler(event, context):
+    database = 'default'
+    
+    now = datetime.utcnow() + timedelta(hours=7)  # Adjusting for UTC+7 timezone
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+    day = now.strftime("%d")
+    hour = now.strftime("%H")
+    
+    s3_output_base = 's3://centralized-logs-network-account/vpc_flow_logs'
+    
+    queries = [
+    """SELECT 
+        REGEXP_REPLACE(version, '^{"message":"', '') AS version,
+        "account-id",
+        action,
+        bytes,
+        dstaddr,
+        dstport,
+        "end",
+        "instance-id",
+        "interface-id",
+        "log-status",
+        packets,
+        "pkt-dstaddr",
+        "pkt-srcaddr",
+        protocol,
+        srcaddr,
+        srcport,
+        "start",
+        "subnet-id",
+        "tcp-flags",
+        "vpc-id",
+        REGEXP_REPLACE("log-type", '"}$', '') AS "log-type",
+        "security-group-ids-str",
+        "network-acl-id",
+        year,
+        month,
+        day,
+        from_unixtime("start") AS utctimezone, 
+        date_add('second', 7 * 3600, from_unixtime("start")) AS localtimezone
+    FROM vpc_flow_logs_updated
+    WHERE 
+        (srcaddr IN ('192.0.2.0', '198.51.100.1') 
+        OR dstaddr IN ('192.0.2.0', '198.51.100.1'))
+        AND action = 'ACCEPT'
+        AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+    ORDER BY from_unixtime("start") DESC""",
+    
+    """SELECT *, 
+              from_unixtime("start") as utctimezone, 
+              date_add('second', 7 * 3600, from_unixtime("start")) as localtimezone
+       FROM vpc_flow_logs_updated
+       WHERE 
+           dstport NOT IN (80, 443, 22, 3389)
+           AND action = 'ACCEPT'
+           AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+       ORDER BY from_unixtime("start") DESC""",
+    
+    """SELECT *, 
+              from_unixtime("start") as utctimezone, 
+              date_add('second', 7 * 3600, from_unixtime("start")) as localtimezone
+       FROM vpc_flow_logs_updated
+       WHERE 
+           action = 'REJECT'
+           AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+       ORDER BY from_unixtime("start") DESC""",
+    
+    """SELECT *, 
+              from_unixtime("start") as utctimezone, 
+              date_add('second', 7 * 3600, from_unixtime("start")) as localtimezone
+       FROM vpc_flow_logs_updated
+       WHERE 
+           srcaddr LIKE '10.%'
+           AND dstaddr LIKE '10.%'
+           AND action = 'ACCEPT'
+           AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+       ORDER BY from_unixtime("start") DESC""",
+    
+    """SELECT *, 
+              from_unixtime("start") as utctimezone, 
+              date_add('second', 7 * 3600, from_unixtime("start")) as localtimezone
+       FROM vpc_flow_logs_updated
+       WHERE 
+           bytes > 1000000
+           AND action = 'ACCEPT'
+           AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+       ORDER BY from_unixtime("start") DESC""",
+    
+    """SELECT *, 
+              from_unixtime("start") as utctimezone, 
+              date_add('second', 7 * 3600, from_unixtime("start")) as localtimezone
+       FROM vpc_flow_logs_updated
+       WHERE 
+           protocol NOT IN ('6', '17', '1')
+           AND action = 'ACCEPT'
+           AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+       ORDER BY from_unixtime("start") DESC""",
+    
+    """SELECT "srcaddr", 
+              COUNT(*) as connection_count
+       FROM vpc_flow_logs_updated
+       WHERE action = 'ACCEPT'
+         AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+       GROUP BY "srcaddr"
+       HAVING COUNT(*) > 1000""",
+    
+    """SELECT *, 
+              from_unixtime("start") as utctimezone, 
+              date_add('second', 7 * 3600, from_unixtime("start")) as localtimezone
+       FROM vpc_flow_logs_updated
+       WHERE 
+           dstaddr NOT IN (SELECT DISTINCT dstaddr FROM vpc_flow_logs_updated)
+           AND action = 'ACCEPT'
+           AND from_unixtime("start") >= date_add('minute', -30, current_timestamp)
+       ORDER BY from_unixtime("start") DESC""",
+    
+    """WITH outbound_traffic AS (
+        SELECT
+            "srcaddr",
+            dstaddr,
+            SUM(bytes) AS total_bytes,
+            COUNT(*) AS connections,
+            MAX(from_unixtime("start")) AS last_connection_time
+        FROM
+            vpc_flow_logs_updated
+        WHERE
+            action = 'ACCEPT'
+            AND srcaddr LIKE '10.%' 
+            AND (dstaddr NOT LIKE '10.%' OR dstaddr IS NULL) 
+        GROUP BY
+            "srcaddr",
+            dstaddr
+    )
+    SELECT
+        "srcaddr",
+        dstaddr,
+        total_bytes,
+        connections,
+        last_connection_time
+    FROM
+        outbound_traffic
+    WHERE
+        total_bytes > 500000000 
+    ORDER BY
+        total_bytes DESC""",
+    
+    """SELECT
+            "srcaddr",
+            dstaddr,
+            srcport,
+            dstport,
+            protocol,
+            packets,
+            bytes,
+            "start",
+            "end",
+            from_unixtime(CAST("start" AS BIGINT)) AS start_time_s,
+            from_unixtime(CAST("end" AS BIGINT)) AS end_time_s,
+            action
+        FROM
+            vpc_flow_logs_updated
+        WHERE
+            protocol = '6'
+            AND dstport = 80
+            AND action = 'ACCEPT'
+        ORDER BY
+            start_time_s DESC""",
+
+    """SELECT
+            "srcaddr",
+            dstaddr,
+            dstport,
+            COUNT(*) AS failed_attempts,
+            date_format(from_unixtime(CAST("start" AS BIGINT)), '%Y-%m-%d %H:%i') AS attempt_time
+        FROM
+            vpc_flow_logs_updated
+        WHERE
+            (dstport = 22 OR dstport = 3389)
+            AND action = 'REJECT'
+        GROUP BY
+            "srcaddr",
+            dstaddr,
+            dstport,
+            date_format(from_unixtime(CAST("start" AS BIGINT)), '%Y-%m-%d %H:%i')
+        HAVING
+            COUNT(*) > 10 
+        ORDER BY
+            failed_attempts DESC"""
+]
+
+    
+    query_names = [
+        "suspicious_ip_activity",
+        "unusual_port",
+        "failed_connections",
+        "internal_traffic",
+        "large_data_transfer",
+        "non_standard_protocol",
+        "high_frequency_connections",
+        "unusual_destination",
+        "unusual_data_transfers",
+        "non_encrypted_traffic",
+        "brute_force_attacks"
+    ]
+    
+    for i, query in enumerate(queries):
+        s3_output = f"{s3_output_base}/{year}/{month}/{day}/{hour}/{query_names[i]}/"
+        query_execution_id = run_athena_query(query, database, s3_output)
+        status, response = check_query_status(query_execution_id)
+        if status == 'SUCCEEDED':
+            print(f"Query {query_names[i]} succeeded")
+            query_result_location = response['QueryExecution']['ResultConfiguration']['OutputLocation']
+            bucket = query_result_location.split('/')[2]
+            key = '/'.join(query_result_location.split('/')[3:])
+            gzip_key = download_and_compress_result(bucket, key)
+            print(f"Compressed file uploaded to: {gzip_key}")
+        else:
+            print(f"Query {query_names[i]} failed with status: {status}")
+            if 'StateChangeReason' in response['QueryExecution']['Status']:
+                print(f"Reason: {response['QueryExecution']['Status']['StateChangeReason']}")
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Queries executed successfully')
+    }

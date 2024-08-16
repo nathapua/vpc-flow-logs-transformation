@@ -1,0 +1,49 @@
+import json
+import boto3
+import time
+
+# Initialize the Athena client
+athena = boto3.client('athena')
+
+# Function to start an Athena query
+def run_athena_query(query, database, s3_output):
+    response = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': database},
+        ResultConfiguration={'OutputLocation': s3_output}
+    )
+    return response['QueryExecutionId']
+
+# Function to check the status of the Athena query
+def check_query_status(query_execution_id):
+    while True:
+        response = athena.get_query_execution(QueryExecutionId=query_execution_id)
+        status = response['QueryExecution']['Status']['State']
+        if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            return status, response
+        time.sleep(5)
+
+# Lambda handler function
+def lambda_handler(event, context):
+    # Set the database name and the S3 output location
+    database = 'default'
+    query = "MSCK REPAIR TABLE vpc_flow_logs_updated;"
+    s3_output = 's3://centralized-logs-line-oa-pre-prod/vpc_flow_logs/msck_output/'
+
+    # Start the Athena query
+    query_execution_id = run_athena_query(query, database, s3_output)
+    
+    # Check the query status
+    status, response = check_query_status(query_execution_id)
+    
+    if status == 'SUCCEEDED':
+        print("MSCK REPAIR TABLE query succeeded")
+    else:
+        print(f"MSCK REPAIR TABLE query failed with status: {status}")
+        if 'StateChangeReason' in response['QueryExecution']['Status']:
+            print(f"Reason: {response['QueryExecution']['Status']['StateChangeReason']}")
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('MSCK REPAIR TABLE executed successfully')
+    }
